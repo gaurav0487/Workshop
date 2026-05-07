@@ -14,9 +14,13 @@ import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 
+// Docker image tag — built once from this repo's Dockerfile (LibreOffice +
+// poppler-utils + metric-compatible fonts on debian-slim).
 const IMAGE = "cwc-pptx-render";
 
 export async function renderPptx(pptxPath: string, outDir: string): Promise<string[]> {
+  // Resolve to absolute host paths for the bind mounts, and split out the
+  // basename / stem so the in-container shell can reference them.
   const absPptx = path.resolve(pptxPath);
   const absOut = path.resolve(outDir);
   const inputDir = path.dirname(absPptx);
@@ -25,6 +29,10 @@ export async function renderPptx(pptxPath: string, outDir: string): Promise<stri
 
   await fs.mkdir(absOut, { recursive: true });
 
+  // Run a throwaway container with the deck's directory mounted read-only at
+  // /in and the output directory mounted at /out. Inside it, LibreOffice
+  // headless converts pptx→pdf, then pdftoppm rasterises one JPG per page.
+  // --pull=never makes a missing image fail fast instead of trying Docker Hub.
   // Filenames are passed as positional args ($1, $2) rather than interpolated
   // into the sh -c script, so shell metacharacters in paths can't break out.
   await execFileP("docker", [
@@ -44,6 +52,8 @@ export async function renderPptx(pptxPath: string, outDir: string): Promise<stri
     stem,
   ]);
 
+  // Collect the produced slide-N.jpg files and return them in slide order
+  // (numeric collation so slide-10 comes after slide-9, not after slide-1).
   const entries = await fs.readdir(absOut);
   return entries
     .filter((n) => /\.jpe?g$/i.test(n))
@@ -51,6 +61,8 @@ export async function renderPptx(pptxPath: string, outDir: string): Promise<stri
     .map((n) => path.join(absOut, n));
 }
 
+// Standalone CLI: `npm run render -- <task_id>` renders runs/<task>/output.pptx
+// without grading, so attendees can flip through JPGs in any image viewer.
 if (import.meta.url === `file://${process.argv[1]}`) {
   const { RUNS_DIR, tasks } = await import("./lib.js");
   const taskId = process.argv[2];

@@ -65,6 +65,8 @@ const EMPTY = (exists: boolean, validZip: boolean): ParsedPptx => ({
 });
 
 export async function parsePptx(pptxPath: string): Promise<ParsedPptx> {
+    // Read the deck off disk. If it's missing the agent never produced one —
+    // return EMPTY(false, …) so the `exec` grader can report MIS.
     let buf: Buffer;
     try {
         buf = await fs.readFile(pptxPath);
@@ -72,6 +74,8 @@ export async function parsePptx(pptxPath: string): Promise<ParsedPptx> {
         return EMPTY(false, false);
     }
 
+    // A .pptx is a zip archive of XML parts. If it doesn't unzip, the agent
+    // wrote something but it's corrupt — `exec` grader reports INV.
     let zip: JSZip;
     try {
         zip = await JSZip.loadAsync(buf);
@@ -79,15 +83,22 @@ export async function parsePptx(pptxPath: string): Promise<ParsedPptx> {
         return EMPTY(true, false);
     }
 
+    // Slides live at ppt/slides/slideN.xml. Find them all and sort by N so
+    // perSlide[0] is slide 1 regardless of zip entry order.
     const slideEntries = Object.keys(zip.files)
         .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
         .sort((a, b) => slideIndex(a) - slideIndex(b));
 
+    // Keep XML attributes (ignoreAttributes: false) — they carry the data we
+    // need, like font size (a:rPr@sz) and placeholder type (p:ph@type).
+    // Prefixing them with @_ keeps them distinguishable from child elements.
     const parser = new XMLParser({
         ignoreAttributes: false,
         attributeNamePrefix: "@_",
     });
 
+    // Parse each slide's XML once and run both extractors over the same DOM:
+    // structural counts for the code graders, title/body for the coherence judge.
     const perSlide: SlideMetrics[] = [];
     const slideTexts: SlideTexts[] = [];
     for (let i = 0; i < slideEntries.length; i++) {
@@ -111,6 +122,10 @@ function slideIndex(name: string): number {
 }
 
 function analyzeSlide(index: number, doc: unknown): SlideMetrics {
+    // Every visible thing on a slide hangs off p:sld → p:cSld → p:spTree.
+    // Count the five top-level shape kinds OOXML defines (text shapes,
+    // pictures, charts/tables, groups, connectors) for the clutter metric,
+    // and pictures separately for the img% metric.
     const spTree = pluck(doc, ["p:sld", "p:cSld", "p:spTree"]) ?? {};
     const shapeCount =
         countShapes(spTree, "p:sp") +
@@ -120,10 +135,14 @@ function analyzeSlide(index: number, doc: unknown): SlideMetrics {
         countShapes(spTree, "p:cxnSp");
     const pictureCount = countShapes(spTree, "p:pic");
 
+    // Collect every text run (<a:r>) on the slide along with its font size,
+    // then concatenate to get total text — feeds the dense and emoji graders.
     const runs: { text: string; sizePt?: number }[] = [];
     walkRuns(doc, runs);
     const text = runs.map((r) => r.text).join("");
 
+    // Distinct font sizes used, ascending — the font<14 grader looks at the
+    // smallest one to check the readability floor.
     const fontSizesPt = Array.from(
         new Set(runs.map((r) => r.sizePt).filter((s): s is number => typeof s === "number")),
     ).sort((a, b) => a - b);
@@ -138,6 +157,7 @@ function analyzeSlide(index: number, doc: unknown): SlideMetrics {
     };
 }
 
+/** Safe nested-property lookup through the parsed XML object tree. */
 function pluck(node: unknown, keys: string[]): unknown {
     let cur: unknown = node;
     for (const k of keys) {
@@ -147,6 +167,10 @@ function pluck(node: unknown, keys: string[]): unknown {
     return cur;
 }
 
+/**
+ * Count direct children of `key` under spTree. fast-xml-parser returns a
+ * single child as an object and multiple children as an array, so normalise.
+ */
 function countShapes(spTree: unknown, key: string): number {
     if (spTree == null || typeof spTree !== "object") return 0;
     const v = (spTree as Record<string, unknown>)[key];
@@ -154,6 +178,11 @@ function countShapes(spTree: unknown, key: string): number {
     return Array.isArray(v) ? v.length : 1;
 }
 
+/**
+ * Recursively collect every DrawingML text run (<a:r>) under `node`.
+ * Each run contributes its literal text (<a:t>) and optional font size
+ * (<a:rPr sz="…">, in hundredths of a point — divide by 100).
+ */
 function walkRuns(node: unknown, out: { text: string; sizePt?: number }[]): void {
     if (node == null || typeof node !== "object") return;
     if (Array.isArray(node)) {
@@ -161,6 +190,7 @@ function walkRuns(node: unknown, out: { text: string; sizePt?: number }[]): void
         return;
     }
     const obj = node as Record<string, unknown>;
+    // Extract this element's own runs, if any.
     const r = obj["a:r"];
     if (r != null) {
         const arr = Array.isArray(r) ? r : [r];
@@ -176,6 +206,7 @@ function walkRuns(node: unknown, out: { text: string; sizePt?: number }[]): void
             out.push({ text, sizePt });
         }
     }
+    // Recurse into child elements (skip XML attributes and the runs we just handled).
     for (const k of Object.keys(obj)) {
         if (k.startsWith("@_") || k === "a:r") continue;
         walkRuns(obj[k], out);
@@ -196,6 +227,10 @@ interface SlideShape {
     maxSizePt: number;
 }
 
+/**
+ * Flatten each text shape (<p:sp>) on the slide to {placeholder type, full
+ * text, largest font size} — the three signals the title heuristic needs.
+ */
 function collectShapes(spTree: unknown): SlideShape[] {
     const out: SlideShape[] = [];
     if (spTree == null || typeof spTree !== "object") return out;
@@ -204,9 +239,12 @@ function collectShapes(spTree: unknown): SlideShape[] {
     const arr = Array.isArray(sps) ? sps : [sps];
     for (const sp of arr) {
         if (sp == null || typeof sp !== "object") continue;
+        // Placeholder type ("title", "ctrTitle", "body", …) is buried under
+        // the shape's non-visual properties at p:nvSpPr → p:nvPr → p:ph@type.
         const ph = pluck(sp, ["p:nvSpPr", "p:nvPr", "p:ph"]);
         const phType =
             ph && typeof ph === "object" ? (ph as Record<string, unknown>)["@_type"] : undefined;
+        // Gather this shape's text runs and their sizes from its <p:txBody>.
         const runs: { text: string; sizePt?: number }[] = [];
         walkRuns((sp as Record<string, unknown>)["p:txBody"], runs);
         const text = runs
@@ -227,6 +265,8 @@ function extractSlideTexts(index: number, doc: unknown): SlideTexts {
     const spTree = pluck(doc, ["p:sld", "p:cSld", "p:spTree"]) ?? {};
     const shapes = collectShapes(spTree).filter((s) => s.text.length > 0);
 
+    // Apply the heuristic documented above: explicit title placeholder first,
+    // else the shape with the biggest font, else whatever comes first.
     let titleShape: SlideShape | undefined = shapes.find(
         (s) => s.phType === "title" || s.phType === "ctrTitle",
     );
@@ -234,6 +274,7 @@ function extractSlideTexts(index: number, doc: unknown): SlideTexts {
         const byFont = [...shapes].sort((a, b) => b.maxSizePt - a.maxSizePt);
         titleShape = byFont[0];
     }
+    // Title = that shape's text; body = everything else, newline-joined.
     const title = titleShape?.text ?? "";
     const body = shapes
         .filter((s) => s !== titleShape)

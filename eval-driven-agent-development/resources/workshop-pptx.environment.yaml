@@ -9,4 +9,4 @@ config:
       - poppler-utils
     pip:
       - python-pptx
-      - matplotlib
+      # - matplotlib

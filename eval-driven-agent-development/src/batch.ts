@@ -3,7 +3,7 @@
 
 /**
  * Full sweep: every agent variant × every task. Rounds run sequentially
- * (10 tasks parallel within a round) to avoid hammering CMA with 60
+ * (5 tasks parallel within a round) to avoid hammering CMA with 25
  * simultaneous sessions. After each round, decks are rendered + graded
  * in place so partial results survive if the run is interrupted.
  *
@@ -14,7 +14,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { ROOT, downloadAll, listOutputs, tasks } from "./lib.js";
+import pRetry from "p-retry";
+import { ROOT, tasks } from "./lib.js";
 import { renderPptx } from "./render.js";
 
 const ENVIRONMENT_ID = "env_01PSAtKYnL8cp5iFKw19bVyC";
@@ -61,10 +62,26 @@ async function runOne(roundKey: string, agentId: string, taskId: string, prompt:
         }
     }
 
-    const files = await listOutputs(client, session.id, (fs) =>
-        fs.some((f) => f.filename.endsWith(".pptx")),
-    );
-    await downloadAll(client, files, dir);
+    const files = await pRetry(
+        async () => {
+            const { data } = await client.beta.files.list({
+                scope_id: session.id,
+                betas: ["managed-agents-2026-04-01"],
+            });
+            if (!data.some((f) => f.filename.endsWith(".pptx"))) {
+                throw new Error("not indexed yet");
+            }
+            return data;
+        },
+        { retries: 10, minTimeout: 1000, factor: 2, maxTimeout: 10000 },
+    ).catch(() => []);
+
+    await fs.mkdir(dir, { recursive: true });
+    for (const f of files) {
+        const local = path.join(dir, path.basename(f.filename));
+        const resp = await client.beta.files.download(f.id);
+        await fs.writeFile(local, Buffer.from(await resp.arrayBuffer()));
+    }
     const pptx = path.join(dir, "output.pptx");
     try {
         await renderPptx(pptx, path.join(dir, "render"));

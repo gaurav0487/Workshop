@@ -1,12 +1,7 @@
 [
-  {"id": "art_photos", "prompt": "Create a 5-slide presentation introducing modern photography movements."},
-  {"id": "business", "prompt": "Make a 5-slide pitch deck for a B2B SaaS startup that helps restaurants manage suppliers."},
   {"id": "career", "prompt": "Create a 5-slide presentation on how to negotiate a salary increase."},
-  {"id": "design", "prompt": "Make a 5-slide deck about the principles of minimalist UI design."},
-  {"id": "entrepreneur", "prompt": "Create a 5-slide presentation on lessons from first-time founders."},
   {"id": "environment", "prompt": "Make a 5-slide deck explaining the impact of microplastics on marine ecosystems."},
   {"id": "food", "prompt": "Create a 5-slide presentation introducing the basics of sourdough baking."},
-  {"id": "marketing", "prompt": "Make a 5-slide deck on building a brand voice for a DTC skincare company."},
   {"id": "social_media", "prompt": "Create a 5-slide presentation on how to grow an engaged TikTok following."},
   {"id": "technology", "prompt": "Make a 5-slide overview of how transformers work for a non-technical audience."}
 ]
