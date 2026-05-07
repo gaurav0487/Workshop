@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # Copyright 2026 Anthropic PBC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Workshop starter — Claude Managed Agents edition.
 
@@ -596,12 +607,17 @@ def _apply_reset(bot_base, headers):
     iron_pickaxe, position is at depth). Retries the whole thing —
     covers the bot reconnecting mid-call, transient op loss, or a
     /give that the server dropped."""
+    last_err = ""
     for attempt in range(6):
         try:
+            # 'stop' first to abort any in-flight/queued action (e.g. a
+            # long go_near left over from --eval). Then reset_run.
+            httpx.post(f"{bot_base}/action", json={"name": "stop"},
+                       headers=headers, timeout=5.0)
             r = httpx.post(
                 f"{bot_base}/action",
                 json={"name": "reset_run", "args": {}},
-                headers=headers, timeout=10.0,
+                headers=headers, timeout=30.0,
             )
             r.raise_for_status()
             time.sleep(1.0)
@@ -612,12 +628,20 @@ def _apply_reset(bot_base, headers):
             kit_ok = {"iron_pickaxe", "iron_ingot", "crafting_table"} <= inv
             if kit_ok and y is not None and y < 0:
                 return
-            print(f"  [start_kit] not applied yet (y={y}, kit={kit_ok}); "
+            last_err = f"y={y}, kit={kit_ok}"
+            print(f"  [start_kit] not applied yet ({last_err}); "
                   f"retrying…", flush=True)
         except Exception as e:  # noqa: BLE001
+            last_err = str(e)
             print(f"  [start_kit] reset attempt {attempt+1} failed: {e}",
                   flush=True)
         time.sleep(2)
+    if "timed out" in last_err.lower() or "timeout" in last_err.lower():
+        raise SystemExit(
+            "✗ reset_run timed out 6× — the bot is busy executing a "
+            "long action (often a leftover from --eval).\n"
+            "  Wait ~30s and retry, or: ./setup.sh --restart && rm -f .agent_cache.json"
+        )
     raise SystemExit(
         "✗ start_kit did not apply after 6 retries — the bot's op "
         "commands (/tp, /give) are being rejected.\n"

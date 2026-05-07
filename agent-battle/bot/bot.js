@@ -1,5 +1,16 @@
 // Copyright 2026 Anthropic PBC
-// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Mineflayer bot + Express HTTP seam.
 //
@@ -1142,6 +1153,26 @@ app.post('/action', requireAuth, async (req, res) => {
   if (!name) return res.status(400).json({ ok: false, error: 'missing action name' });
   if (!actions[name]) return res.status(400).json({ ok: false, error: `unknown action: ${name}` });
   if (!spawned) return res.status(503).json({ ok: false, error: 'bot not spawned yet' });
+  // reset_run and stop must preempt: --eval can leave long go_near/
+  // mine_block calls queued (4 concurrent probes × up to 90s each),
+  // and a reset_run that queues behind them times out the harness.
+  // Cancel the in-flight action AND drop the pending queue, then run
+  // outside withBusy so it can't be blocked.
+  if (name === 'stop' || name === 'reset_run') {
+    try {
+      try { bot.pathfinder?.setGoal(null); } catch {}
+      try { bot.stopDigging?.(); } catch {}
+      try { bot.collectBlock?.cancelTask?.(); } catch {}
+      busyTail = Promise.resolve();
+      busy = false;
+      const result = await actions[name](args || {});
+      lastError = null;
+      return res.json({ ok: true, ...result });
+    } catch (e) {
+      lastError = e.message;
+      return res.json({ ok: false, error: e.message });
+    }
+  }
   // Concurrent requests queue inside withBusy; no upfront 409.
   try {
     const result = await withBusy((signal) => actions[name](args || {}, signal));
