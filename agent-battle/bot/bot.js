@@ -46,6 +46,14 @@ const TICK_RATE = parseInt(process.env.TICK_RATE || '20', 10);
 // When set, /action and /mcp require `Authorization: Bearer <BOT_TOKEN>`.
 // Empty/unset = auth disabled (local-dev convenience; warning logged below).
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
+// Relay mode: when both are set, the bot dials OUT to the event server's
+// /relay/ws and the agent reaches it at <RELAY_URL>/p/<RELAY_KEY>/mcp.
+// No tunnel needed. setup.sh generates RELAY_KEY and persists it so the
+// MCP URL stays stable across restarts. Without these, the bot is
+// localhost-only and a cloudflared quick-tunnel is needed for cloud agents
+// to reach it (the pre-relay fallback path).
+const RELAY_URL = process.env.RELAY_URL || '';
+const RELAY_KEY = process.env.RELAY_KEY || '';
 
 let bot = null;
 let busy = false;
@@ -1261,6 +1269,24 @@ async function setupMcp() {
 }
 
 setupMcp().catch((e) => console.log('[bot] MCP setup failed:', e));
+
+// ─── Relay client (event mode) ──────────────────────────────────────────────
+// Outbound connection to the event server; replaces the per-participant
+// cloudflared tunnel. The same dispatchMcpTool() the local /mcp endpoint
+// uses handles relayed calls, so behavior is identical either way.
+if (RELAY_URL && RELAY_KEY) {
+  const { startRelayClient } = require('./relay-client.cjs');
+  startRelayClient({
+    relayUrl: RELAY_URL,
+    key: RELAY_KEY,
+    workshopKey: process.env.LEADERBOARD_KEY || '',
+    participant: process.env.PARTICIPANT || USERNAME,
+    tools: MCP_TOOLS,
+    dispatch: dispatchMcpTool,
+  });
+} else if (RELAY_URL || RELAY_KEY) {
+  console.log('[bot] relay NOT started — both RELAY_URL and RELAY_KEY must be set');
+}
 
 app.listen(HTTP_PORT, () => {
   console.log(`[bot] HTTP API on http://localhost:${HTTP_PORT}`);

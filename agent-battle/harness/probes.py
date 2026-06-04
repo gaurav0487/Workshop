@@ -359,7 +359,7 @@ PROBES: list[Probe] = [
 ]
 
 
-def run(client, agent_id: str, env_id: str) -> int:
+def run(client, agent_id: str, env_id: str, vault_ids=None) -> int:
     """Run all probes against the given CMA agent. Returns count of GOODs.
     Probes execute concurrently (each is an independent CMA session) so
     wall-clock is ~max(probe) not sum(probes)."""
@@ -369,7 +369,8 @@ def run(client, agent_id: str, env_id: str) -> int:
           f"{workers} concurrent\n", flush=True)
     results: dict[int, tuple] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_probe_one, client, agent_id, env_id, p): (i, p)
+        futs = {ex.submit(_probe_one, client, agent_id, env_id, p,
+                           vault_ids): (i, p)
                 for i, p in enumerate(PROBES, 1)}
         for fut in concurrent.futures.as_completed(futs):
             i, p = futs[fut]
@@ -408,10 +409,12 @@ def run(client, agent_id: str, env_id: str) -> int:
     return goods
 
 
-def _probe_one(client, agent_id, env_id, probe: Probe):
+def _probe_one(client, agent_id, env_id, probe: Probe, vault_ids=None):
     """One session, one synthetic state, capture first non-get_state tool."""
+    extra = {"vault_ids": vault_ids} if vault_ids else {}
     sess = client.beta.sessions.create(
         agent=agent_id, environment_id=env_id, title=f"eval:{probe.key}",
+        **extra,
     )
     parts = ["[EVAL PROBE] If you have any skills attached, read them first."]
     if probe.preamble:

@@ -1,0 +1,54 @@
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Fly.io config for the Agent Battle event server.
+#
+#   fly launch --copy-config --no-deploy   # first time (pick an app name)
+#   fly volumes create event_data --size 1 --region nrt
+#   fly secrets set WORKSHOP_KEY=devkey ADMIN_KEY=$(openssl rand -hex 16)
+#   fly secrets set MC_SEED=611578087908456433 EVENT_NAME="Agent Battle — Tokyo"
+#   fly secrets set PUBLIC_URL=https://<app-name>.fly.dev
+#   fly deploy
+#
+# Region: nrt = Tokyo. Change primary_region for other venues.
+
+app = "agent-battle"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8888"
+  DATA_DIR = "/data"
+
+[http_service]
+  internal_port = 8888
+  force_https = true
+  # Never scale to zero: bots hold WebSocket connections to the relay and
+  # the projector polls the cast view all day.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 400
+    hard_limit = 500
+
+[mounts]
+  source = "event_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 8888
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"

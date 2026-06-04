@@ -70,7 +70,7 @@ SKILL_MINING = "skills/mining"
 #     context every turn. Guaranteed to land; costs tokens every turn.
 MCP_MINECRAFT_WIKI = {
     "type": "url", "name": "wiki",
-    "url": os.environ.get("WIKI_MCP_URL", "http://localhost:8077/mcp"),
+    "url": os.environ.get("WIKI_MCP_URL", "http://localhost:8888/wiki/mcp"),
 }
 #   ↑ An MCP server with one tool: lookup(query) → fact. Attaching it
 #     gives the agent the OPTION to look things up. Costs nothing
@@ -181,10 +181,110 @@ def _resolve_skills(client, cache, entries):
     return out
 
 
+def _bot_mcp_url(client, cache):
+    """Resolve the URL CMA uses to reach this participant's bot.
+
+    Preferred (event mode): a header-authenticated endpoint. We store the
+    relay key as a CMA vault `static_bearer` credential bound to a
+    per-participant URL (<relay>/bot/<name>/mcp); CMA then sends it as an
+    Authorization header. This keeps the secret out of URL paths — which
+    server-side infrastructure (e.g. Cloud Run request logs) records even
+    when the application masks its own logs.
+
+    Fallback: the legacy URL-keyed endpoint when the URL shape isn't
+    recognized (hand-exported tunnel URLs) or the vault API is
+    unavailable on this account.
+
+    The public base is derived from BOT_MCP_URL — NOT from RELAY_URL.
+    In solo mode RELAY_URL is localhost (the local event server) while
+    BOT_MCP_URL is the public quick-tunnel in front of it; CMA connects
+    from Anthropic's cloud and can only reach the public host. In event
+    mode both share the same public host, so the derivation is identical.
+    """
+    import re
+    from urllib.parse import quote
+
+    relay_key = os.environ.get("RELAY_KEY", "")
+    m = (re.match(rf"(.+?)/p/{re.escape(relay_key)}/mcp/?$", BOT_MCP_URL)
+         if relay_key else None)
+    if not m:
+        return BOT_MCP_URL  # unrecognized shape — use as-is (legacy)
+    public_base = m.group(1)
+    header_url = f"{public_base}/bot/{quote(PARTICIPANT, safe='')}/mcp"
+    try:
+        _ensure_vault_credential(client, cache, header_url, relay_key)
+        return header_url
+    except Exception as e:  # noqa: BLE001 — never block a run on vault plumbing
+        print(f"  [vault] header-auth unavailable ({type(e).__name__}: {e}) — "
+              f"falling back to URL-keyed endpoint", flush=True)
+        return BOT_MCP_URL
+
+
+def _session_vault_ids():
+    """Vault ids to attach to CMA sessions. A vault credential only takes
+    effect when the SESSION carries its vault — creating the credential
+    alone is not enough (the header silently never gets sent and the agent
+    sees zero tools)."""
+    try:
+        cache = json.loads(_CACHE.read_text()) if _CACHE.exists() else {}
+    except Exception:  # noqa: BLE001
+        return None
+    vid = (cache.get("vault") or {}).get("_vault_id")
+    return [vid] if vid else None
+
+
+def _ensure_vault_credential(client, cache, mcp_server_url, token):
+    """Create/refresh the static_bearer vault credential binding `token`
+    to `mcp_server_url`. Credentials live inside a vault: find-or-create
+    a vault named 'agent-battle', then find-or-create/update the
+    credential for this URL under it. Cached by URL + token hash so
+    reruns are free."""
+    vaults_api = client.beta.vaults
+    vault_cache = cache.setdefault("vault", {})
+    token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+    entry = vault_cache.get(mcp_server_url) or {}
+    if entry.get("token_hash") == token_hash and entry.get("cred_id"):
+        return entry["cred_id"]
+
+    vault_id = vault_cache.get("_vault_id")
+    if not vault_id:
+        existing_vault = next(
+            (v for v in vaults_api.list()
+             if getattr(v, "display_name", "") == "agent-battle"), None)
+        if existing_vault:
+            vault_id = existing_vault.id
+        else:
+            print("  creating CMA vault 'agent-battle'...", flush=True)
+            vault_id = vaults_api.create(display_name="agent-battle").id
+        vault_cache["_vault_id"] = vault_id
+
+    auth = {"type": "static_bearer", "token": token,
+            "mcp_server_url": mcp_server_url}
+    creds = vaults_api.credentials
+    cred_id = entry.get("cred_id")
+    if not cred_id:
+        # Reuse an existing credential for this URL (cache wipe / re-clone).
+        existing_cred = next(
+            (c for c in creds.list(vault_id)
+             if getattr(getattr(c, "auth", None), "mcp_server_url", None)
+             == mcp_server_url), None)
+        cred_id = existing_cred.id if existing_cred else None
+    if cred_id:
+        creds.update(cred_id, vault_id=vault_id, auth=auth)
+    else:
+        print("  registering relay credential in CMA vault...", flush=True)
+        cred_id = creds.create(
+            vault_id=vault_id, auth=auth,
+            display_name=f"agent-battle relay ({PARTICIPANT})",
+        ).id
+    vault_cache[mcp_server_url] = {"cred_id": cred_id, "token_hash": token_hash}
+    return cred_id
+
+
 def _build_spec(client, cache):
     """Assemble the full CMA agent spec from the AGENT dict."""
     extra_mcp = list(AGENT.get("mcp_servers") or [])
-    mcp_servers = [{"type": "url", "name": "minecraft", "url": BOT_MCP_URL}]
+    mcp_servers = [{"type": "url", "name": "minecraft", "url": _bot_mcp_url(client, cache)}]
     mcp_servers.extend(extra_mcp)
     minecraft_toolset = {
         "type": "mcp_toolset",
@@ -418,12 +518,11 @@ def main(dry_run=False, eval=False):
     with open(lock, "w") as f:
         f.write(str(os.getpid()))
     atexit.register(lambda: os.path.exists(lock) and os.remove(lock))
-    # Preflight: verify the bot's MCP server is reachable AT THE TUNNEL
-    # URL (not localhost). If CMA can't reach it, the agent silently gets
-    # zero minecraft tools and replies "I can't play games". Quick-tunnels
-    # die for many reasons (DNS lag, laptop sleep, VPN change, process
-    # crash) — auto-recover by minting a fresh tunnel rather than failing.
-    BOT_MCP_URL = _ensure_tunnel(BOT_MCP_URL)
+    # Preflight: verify the bot is up locally AND registered with the
+    # event relay. If CMA can't reach the bot's MCP URL, the agent
+    # silently gets zero minecraft tools and replies "I can't play
+    # games" — catching that here saves a wasted 5-minute run.
+    BOT_MCP_URL = _ensure_reachable(BOT_MCP_URL)
 
     # Reset the bot for a fresh 5-min run: zero the diamond counter,
     # apply the fixed start_kit (TP to y=-40 lit room with iron_pickaxe
@@ -450,11 +549,13 @@ def main(dry_run=False, eval=False):
         # decisions, without 5 minutes of vein-luck noise.
         from harness import probes
         _close_logger(ctx)
-        return probes.run(client, agent.id, env.id)
+        return probes.run(client, agent.id, env.id,
+                          vault_ids=_session_vault_ids())
 
     print("starting session...", flush=True)
     session = client.beta.sessions.create(
         agent=agent.id, environment_id=env.id, title=f"{PARTICIPANT} → {TARGET}",
+        **({"vault_ids": v} if (v := _session_vault_ids()) else {}),
     )
     print(f"session: {session.id}  — streaming events (Ctrl-C to stop, deadline {deadline}s)\n", flush=True)
     # Stop the cloud-side session even if this process dies abruptly. CMA
@@ -514,21 +615,24 @@ def main(dry_run=False, eval=False):
         print(f"\n{ctx.done or 'session ended'}  turns={ctx.cost.turns} tokens={ctx.cost.tokens}{suffix}")
 
 
-def _ensure_tunnel(url):
-    """Return a BOT_MCP_URL that CMA can use. We deliberately do NOT
-    test the public hostname from this machine — corp DNS / VPN / MDM
-    on the participant's laptop often can't resolve *.trycloudflare.com
-    even when the tunnel is fine globally. CMA connects from
-    Anthropic's network, not here. What matters locally:
-      (a) the bot is serving on localhost:HTTP_PORT
-      (b) a cloudflared process is running for that port
-      (c) the URL we hand CMA matches the running tunnel's log
-    If any of those fail, re-run tunnel.sh to mint a fresh one."""
-    import subprocess, re
+def _ensure_reachable(url):
+    """Preflight for the bot's MCP URL. Two things must be true for the
+    cloud agent to play: (a) the bot is alive on localhost, and (b) the
+    bot's outbound relay connection to the event server is registered
+    (the agent connects to <event-server>/p/<key>/mcp, which forwards
+    over that connection).
+
+    The relay client inside bot.js reconnects automatically with backoff,
+    so this never "fixes" anything — it just refuses to start a 5-minute
+    run that would silently produce an agent with no tools.
+
+    Registration is checked via localhost first (solo mode runs the relay
+    locally; also immune to corp VPN / DNS that can't resolve public
+    hostnames), then via the public relay URL (event mode — normal DNS,
+    works on VPN unlike *.trycloudflare.com)."""
+    import re
 
     bot_local = os.environ.get("BOT_STATE_URL", "http://localhost:8088")
-    http_port = bot_local.rsplit(":", 1)[-1]
-    cflog = f"/tmp/cf-tunnel-{http_port}.log"
 
     def bot_up():
         try:
@@ -537,22 +641,7 @@ def _ensure_tunnel(url):
         except Exception:
             return False
 
-    def cloudflared_running():
-        try:
-            out = subprocess.run(["pgrep", "-fl", "cloudflared"],
-                                 capture_output=True, text=True).stdout
-            return f":{http_port}" in out
-        except Exception:
-            return False
-
-    def url_in_log(u):
-        try:
-            host = u.rsplit("/mcp", 1)[0].split("://", 1)[-1]
-            return host and host in open(cflog).read()
-        except Exception:
-            return False
-
-    print("verifying bot + tunnel ...", flush=True)
+    print("verifying bot + relay ...", flush=True)
     if not bot_up():
         raise SystemExit(
             f"✗ bot not responding at {bot_local}/state.\n"
@@ -560,46 +649,45 @@ def _ensure_tunnel(url):
         )
     print(f"  ✓ bot on {bot_local}", flush=True)
 
-    if cloudflared_running() and url_in_log(url):
-        print(f"  ✓ tunnel {url} (cloudflared running, URL matches log)",
+    m = re.match(r"(.+?)/p/([^/]+)/mcp/?$", url)
+    if not m:
+        # Not a relay URL (hand-exported legacy tunnel?). Nothing more we
+        # can verify locally — corp DNS often can't resolve tunnel
+        # hostnames even when they're fine globally. Trust it.
+        print(f"  ? {url} is not a relay URL; skipping registration check",
               flush=True)
         return url
+    base, key = m.group(1), m.group(2)
 
-    print(f"  ↻ tunnel stale or not running — minting a fresh one",
-          flush=True)
-    try:
-        out = subprocess.run(
-            ["bash", "./bot/tunnel.sh"], capture_output=True, text=True,
-            timeout=60, check=True,
-        ).stdout
-    except Exception as e:
-        raise SystemExit(
-            f"✗ could not start tunnel ({e}). Try: ./setup.sh --restart"
-        )
-    m = re.search(r"BOT_MCP_URL='([^']+)'", out)
-    new = m.group(1) if m else ""
-    if not new or not cloudflared_running():
-        raise SystemExit(
-            f"✗ tunnel.sh did not produce a running tunnel.\n"
-            f"  Log: {cflog}\n  Try: ./setup.sh --restart"
-        )
-    print(f"  ✓ tunnel {new}", flush=True)
-    # Wait briefly so Cloudflare's edge picks up the route before CMA
-    # tries to connect. No local DNS check — see docstring.
-    time.sleep(8)
-    # Force re-registration with the new URL and persist it for next run.
-    for p in (".agent_cache.json", f".agent_cache-{PARTICIPANT}.json"):
-        try: os.remove(p)
-        except FileNotFoundError: pass
-    try:
-        envfile = f".env.setup{('-' + os.environ['INSTANCE']) if os.environ.get('INSTANCE') else ''}"
-        with open(envfile) as f:
-            txt = f.read()
-        with open(envfile, "w") as f:
-            f.write(re.sub(r"BOT_MCP_URL='[^']*'", f"BOT_MCP_URL='{new}'", txt))
-    except FileNotFoundError:
-        pass
-    return new
+    # Status endpoints to try, most-reliable first.
+    candidates = []
+    relay_env = os.environ.get("RELAY_URL", "").rstrip("/")
+    if relay_env and ("localhost" in relay_env or "127.0.0.1" in relay_env):
+        candidates.append(relay_env)
+    if base not in candidates:
+        candidates.append(base)
+
+    deadline = time.monotonic() + 30
+    last_err = None
+    while time.monotonic() < deadline:
+        for b in candidates:
+            try:
+                r = httpx.get(f"{b}/p/{key}/status", timeout=5.0)
+                if r.status_code == 200 and r.json().get("connected"):
+                    print(f"  ✓ relay registration confirmed", flush=True)
+                    return url
+                last_err = f"{b}: not registered yet"
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{b}: {type(e).__name__}"
+        time.sleep(2)
+    raise SystemExit(
+        "✗ bot is running but NOT registered with the event relay.\n"
+        f"  Last check: {last_err}\n"
+        "  The bot retries automatically; if this persists:\n"
+        "    ./setup.sh --restart    (or /cwc-fix in Claude Code)\n"
+        "  If the venue network blocks WebSockets entirely, ask the\n"
+        "  facilitator — that breaks the relay for everyone, not just you."
+    )
 
 
 def _apply_reset(bot_base, headers):

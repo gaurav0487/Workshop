@@ -21,6 +21,18 @@
 #   ./setup.sh --restart    --stop then start fresh (new world)
 #
 # After it finishes:  python3 my_agent.py
+#
+# Two modes, decided by whether an event server URL is configured:
+#
+#   EVENT mode (EVENT_URL set, usually via .env.event):
+#     Your bot connects OUT to the shared event server's relay. The
+#     cloud agent reaches it at <EVENT_URL>/p/<your-key>/mcp. Nothing
+#     on your machine is exposed; no tunnels are created.
+#
+#   SOLO mode (no EVENT_URL):
+#     A local event server (leaderboard + wiki + relay) starts on :8888
+#     and ONE cloudflared quick-tunnel makes it reachable by the cloud
+#     agent. This is the practice-at-home path.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,16 +52,43 @@ OFFSET="${INSTANCE:-0}"
 export MC_PORT=$((25565 + OFFSET))
 export HTTP_PORT=$((8088 + OFFSET))
 export VIEWER_PORT=$((3007 + OFFSET))
+EVENT_PORT="${EVENT_PORT:-8888}"
 ENVFILE=".env.setup${SUFFIX}"
 PIDFILE="/tmp/agent-battle${SUFFIX}.pids"
-# If LEADERBOARD_URL is already set to a non-localhost host (e.g. the
-# facilitator's shared tunnel), use it and skip starting a local one.
-# Otherwise default to a local in-memory dev-server.
-if [ -n "${LEADERBOARD_URL:-}" ] && ! echo "${LEADERBOARD_URL}" | grep -qE 'localhost|127\.0\.0\.1'; then
-  LOCAL_LB=0
-  say "using shared leaderboard at ${LEADERBOARD_URL}"
+KEYFILE=".relay-key${SUFFIX}"
+
+# ── event config (.env.event, shell exports take precedence) ────────
+# The facilitator commits the live event URL + seed to .env.event so
+# participants only export ANTHROPIC_API_KEY + PARTICIPANT +
+# MINECRAFT_EULA. A re-share via Slack still works without a repo push
+# because shell exports override.
+_from_event() {
+  [ -f .env.event ] || return 0
+  local v; v=$(grep "^$1=" .env.event | head -1 | cut -d= -f2- | tr -d "'\"")
+  [ -n "$v" ] && export "$1=$v" && echo "    $1 ← .env.event"
+}
+say "reading event config"
+[ -z "${EVENT_URL:-}" ]        && _from_event EVENT_URL
+[ -z "${LEADERBOARD_KEY:-}" ]  && _from_event LEADERBOARD_KEY
+[ -z "${MC_SEED:-}" ]          && _from_event MC_SEED
+# Older explicit per-service vars still override the EVENT_URL-derived
+# defaults (back-compat with hand-exported SHARE blocks).
+[ -z "${LEADERBOARD_URL:-}" ]  && _from_event LEADERBOARD_URL
+[ -z "${WIKI_MCP_URL:-}" ]     && _from_event WIKI_MCP_URL
+[ -z "${RELAY_URL:-}" ]        && _from_event RELAY_URL
+
+if [ -n "${EVENT_URL:-}" ]; then
+  EVENT_URL="${EVENT_URL%/}"
+  export LEADERBOARD_URL="${LEADERBOARD_URL:-${EVENT_URL}/api}"
+  export WIKI_MCP_URL="${WIKI_MCP_URL:-${EVENT_URL}/wiki/mcp}"
+  export RELAY_URL="${RELAY_URL:-${EVENT_URL}}"
+fi
+if [ -n "${RELAY_URL:-}" ]; then
+  MODE=event
+  ok "EVENT mode — relay + leaderboard at ${RELAY_URL}"
 else
-  LOCAL_LB=1
+  MODE=solo
+  ok "SOLO mode — local event server + one quick-tunnel"
 fi
 
 for arg in "$@"; do
@@ -58,17 +97,21 @@ for arg in "$@"; do
       say "stopping${INSTANCE:+ instance ${INSTANCE}}..."
       [ -f "$PIDFILE" ] && xargs -r kill 2>/dev/null < "$PIDFILE"
       # Belt-and-suspenders: kill THIS instance's processes by the
-      # ports they listen on. Never touch dev-server.mjs, wiki_mcp.py,
-      # or cloudflared on :8888/:8077 — those belong to host.sh and
-      # killing them changes the room-wide URLs. Port-scoped so
-      # INSTANCE=N never crosses over to other instances.
+      # ports they listen on. Port-scoped so INSTANCE=N never crosses
+      # over to other instances.
       lsof -ti:"${MC_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null
       lsof -ti:"${HTTP_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
       lsof -ti:"${VIEWER_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
-      ps -eo pid,args | awk -v p=":${HTTP_PORT}" 'index($0,"cloudflared")>0 && index($0,p)>0 {print $1}' \
-        | xargs -r kill 2>/dev/null
+      # Solo-mode extras: the local event server and its tunnel. Only
+      # for the base instance — INSTANCE=N never owns these.
+      if [ -z "${INSTANCE}" ]; then
+        ps -eo pid,comm,args | awk '$2=="node" && index($0,"event/server.mjs")>0 {print $1}' \
+          | xargs -r kill 2>/dev/null
+        ps -eo pid,args | awk -v p=":${EVENT_PORT}" 'index($0,"cloudflared")>0 && index($0,p)>0 {print $1}' \
+          | xargs -r kill 2>/dev/null
+        rm -f "/tmp/cf-tunnel-${EVENT_PORT}.log"
+      fi
       ps -eo pid,comm,args | awk '$2~/^python/ && index($0,"my_agent.py")>0 {print $1}' | xargs -r kill 2>/dev/null
-      rm -f "/tmp/cf-tunnel-${HTTP_PORT}.log"
       sleep 2
       [ -f "$PIDFILE" ] && xargs -r kill -9 2>/dev/null < "$PIDFILE"
       rm -f "$PIDFILE"
@@ -76,12 +119,10 @@ for arg in "$@"; do
       exit 0
       ;;
     --restart)
-      # Restart server+bot but KEEP the cloudflared tunnel. At venues
-      # where many participants share one NAT'd IP, every tunnel kill
-      # + recreate counts against Cloudflare's per-IP quick-tunnel
-      # quota; preserving it across --restart means each participant
-      # creates exactly one tunnel for the whole session.
-      say "restarting${INSTANCE:+ instance ${INSTANCE}} (server+bot; tunnel kept)..."
+      # Restart server+bot. In solo mode the event-server tunnel is KEPT
+      # (re-creating it changes the public URL and burns Cloudflare's
+      # per-IP quick-tunnel quota). In event mode there is no tunnel.
+      say "restarting${INSTANCE:+ instance ${INSTANCE}} (server+bot)..."
       lsof -ti:"${MC_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null
       lsof -ti:"${HTTP_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
       lsof -ti:"${VIEWER_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
@@ -92,7 +133,6 @@ for arg in "$@"; do
       [ -f "$PIDFILE" ] && rm -f "$PIDFILE"
       shift
       ;;
-    --no-leaderboard) LOCAL_LB=0 ;;
   esac
 done
 
@@ -128,29 +168,16 @@ if ! python3 -c "import anthropic, httpx, mcp" 2>/dev/null; then
 else
   ok "python deps"
 fi
-if [ ! -d bot/node_modules/mineflayer ]; then
+if [ ! -d bot/node_modules/mineflayer ] || [ ! -d bot/node_modules/ws ]; then
   ( cd bot && npm install --no-audit --no-fund --loglevel=error ) || die "npm install (bot) failed — see error above"
 fi
 ok "bot deps"
-if [ "$LOCAL_LB" = 1 ] && [ ! -d leaderboard/node_modules ]; then
-  ( cd leaderboard && npm install --no-audit --no-fund --loglevel=error ) || die "npm install (leaderboard) failed — see error above"
+if [ "$MODE" = solo ] && [ ! -d event/node_modules ]; then
+  ( cd event && npm install --no-audit --no-fund --loglevel=error ) || die "npm install (event) failed — see error above"
 fi
 
 # ── 3. env ───────────────────────────────────────────────────────────
 say "checking env"
-# Event-day defaults: the facilitator commits live URLs/seed here
-# so participants only export ANTHROPIC_API_KEY + PARTICIPANT +
-# MINECRAFT_EULA. Shell exports take precedence so a re-share via
-# Slack still works without a repo push.
-_from_event() {
-  [ -f .env.event ] || return 0
-  local v; v=$(grep "^$1=" .env.event | head -1 | cut -d= -f2- | tr -d "'\"")
-  [ -n "$v" ] && export "$1=$v" && echo "    $1 ← .env.event"
-}
-[ -z "${LEADERBOARD_URL:-}" ] && _from_event LEADERBOARD_URL
-[ -z "${LEADERBOARD_KEY:-}" ] && _from_event LEADERBOARD_KEY
-[ -z "${WIKI_MCP_URL:-}" ]    && _from_event WIKI_MCP_URL
-[ -z "${MC_SEED:-}" ]         && _from_event MC_SEED
 # Auth: ANTHROPIC_API_KEY is the standard path (console.anthropic.com).
 # The SDK also supports OAuth / workload-identity credentials when the
 # env var is unset, so we warn rather than die — my_agent.py will fail
@@ -183,23 +210,56 @@ export BOT_STATE_URL="http://localhost:${HTTP_PORT}"
 _mcu="$(printf '%s' "${MC_USERNAME:-${PARTICIPANT}}" | tr -c 'A-Za-z0-9_' '_')"
 export MC_USERNAME="${_mcu:0:16}"
 [ -n "${MC_USERNAME}" ] || export MC_USERNAME="claude"
-ok "auth: ${ANTHROPIC_API_KEY:+API key (${#ANTHROPIC_API_KEY} chars)}${ANTHROPIC_API_KEY:-SDK credential chain}, PARTICIPANT='${PARTICIPANT}', mc_username='${MC_USERNAME}'"
+# Relay key: the per-machine secret that is both this bot's identity on
+# the event server and the unguessable part of its MCP URL. Persisted so
+# the URL (and therefore the registered Managed Agent spec) is stable
+# across re-runs and restarts.
+[ -f "${KEYFILE}" ] || python3 -c 'import secrets;print(secrets.token_hex(16))' > "${KEYFILE}"
+RELAY_KEY="$(cat "${KEYFILE}")"
+# NOTE: never echo the key itself — setup output is captured into logs
+# and Claude Code transcripts.
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  _auth_desc="API key (${#ANTHROPIC_API_KEY} chars)"
+else
+  _auth_desc="SDK credential chain"
+fi
+ok "auth: ${_auth_desc}, PARTICIPANT='${PARTICIPANT}', mc_username='${MC_USERNAME}'"
 
-# ── 4. local leaderboard (self-contained test) ──────────────────────
-if [ "$LOCAL_LB" = 1 ]; then
-  if curl -fsS -m 2 http://localhost:8888/api/leaderboard >/dev/null 2>&1; then
-    ok "leaderboard already on :8888"
+# ── 4. local event server (solo mode only) ──────────────────────────
+if [ "$MODE" = solo ]; then
+  # The grep matters: an OLD leaderboard dev-server (pre-overhaul clones)
+  # SPA-fallbacks every path to index.html with a 200 — including
+  # /healthz — and would false-positive a bare curl check. Only the real
+  # event server answers with JSON.
+  if curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" 2>/dev/null | grep -q '"ok":true'; then
+    ok "local event server already on :${EVENT_PORT}"
   else
-    say "starting local leaderboard on :8888"
-    ( cd leaderboard && WORKSHOP_KEY=devkey PORT=8888 \
-        nohup node dev-server.mjs > /tmp/lb-dev.log 2>&1 & echo $! >> "$PIDFILE" )
+    # A stale leaderboard-only process (old dev-server.mjs) on :8888
+    # can't serve the relay — replace it.
+    if lsof -ti:"${EVENT_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+      warn "stale process on :${EVENT_PORT} — killing and restarting"
+      lsof -ti:"${EVENT_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
+      sleep 2
+    fi
+    say "starting local event server on :${EVENT_PORT}"
+    # nohup + ALL THREE fds redirected, no subshell: the portable way to
+    # fully detach. A `( cd dir && nohup ... & )` subshell leaves a process
+    # holding this script's stdout pipe in containerized environments,
+    # hanging anything that captures setup.sh's output. (Not setsid — it
+    # doesn't exist on macOS, where most participants run.)
+    WORKSHOP_KEY="${LEADERBOARD_KEY:-devkey}" PORT="${EVENT_PORT}" MC_SEED="${MC_SEED:-}" \
+      nohup node event/server.mjs < /dev/null > /tmp/event-local.log 2>&1 &
+    echo $! >> "$PIDFILE"
     for _ in $(seq 1 10); do
-      curl -fsS -m 2 http://localhost:8888/api/leaderboard >/dev/null 2>&1 && break
+      curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" >/dev/null 2>&1 && break
       sleep 1
     done
-    ok "leaderboard :8888"
+    curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" >/dev/null 2>&1 \
+      || die "event server failed — see /tmp/event-local.log"
+    ok "event server :${EVENT_PORT} (leaderboard + wiki + relay)"
   fi
-  export LEADERBOARD_URL="${LEADERBOARD_URL:-http://localhost:8888/api}"
+  export RELAY_URL="http://localhost:${EVENT_PORT}"
+  export LEADERBOARD_URL="${LEADERBOARD_URL:-http://localhost:${EVENT_PORT}/api}"
   export LEADERBOARD_KEY="${LEADERBOARD_KEY:-devkey}"
 fi
 
@@ -208,8 +268,9 @@ fi
 # bot from a previous clone holding :HTTP_PORT serves /state but 404s
 # on /view → users see "Cannot GET /view" and assume setup is broken.
 if curl -fsS -m 2 "${BOT_STATE_URL}/state" 2>/dev/null | grep -q '"connected":true' \
-   && curl -fsS -m 2 -o /dev/null -w '%{http_code}' "${BOT_STATE_URL}/view" 2>/dev/null | grep -q '^200$'; then
-  ok "bot already running and connected"
+   && curl -fsS -m 2 -o /dev/null -w '%{http_code}' "${BOT_STATE_URL}/view" 2>/dev/null | grep -q '^200$' \
+   && curl -fsS -m 2 "${RELAY_URL%/}/p/${RELAY_KEY}/status" 2>/dev/null | grep -q '"connected":true'; then
+  ok "bot already running, connected, and registered with the relay"
 else
   if lsof -ti:"${HTTP_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
     warn "stale process on :${HTTP_PORT} — killing and restarting"
@@ -234,7 +295,8 @@ else
   if ! lsof -ti:"${MC_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
     say "starting Minecraft server on :${MC_PORT} (first run downloads ~50MB jar)"
     nohup ./bot/server.sh ${INSTANCE:+--instance "i${INSTANCE}"} --port "${MC_PORT}" \
-      > "${SLOG}" 2>&1 & echo $! >> "$PIDFILE"
+      < /dev/null > "${SLOG}" 2>&1 &
+    echo $! >> "$PIDFILE"
     for _ in $(seq 1 90); do
       grep -q 'Done (' "${SLOG}" 2>/dev/null && break; sleep 1
     done
@@ -251,7 +313,9 @@ else
   say "starting bot on :${HTTP_PORT}"
   PARTICIPANT="${PARTICIPANT}" LEADERBOARD_URL="${LEADERBOARD_URL:-}" \
     LEADERBOARD_KEY="${LEADERBOARD_KEY:-}" \
-    nohup ./bot/run.sh > "${BLOG}" 2>&1 & echo $! >> "$PIDFILE"
+    RELAY_URL="${RELAY_URL}" RELAY_KEY="${RELAY_KEY}" \
+    nohup ./bot/run.sh < /dev/null > "${BLOG}" 2>&1 &
+  echo $! >> "$PIDFILE"
   for _ in $(seq 1 30); do
     grep -q 'spawned at' "${BLOG}" 2>/dev/null && break; sleep 1
   done
@@ -259,14 +323,34 @@ else
   ok "bot :${HTTP_PORT}, viewer :${VIEWER_PORT}"
 fi
 
-# ── 7. tunnel ────────────────────────────────────────────────────────
-say "opening tunnel for CMA"
-eval "$(./bot/tunnel.sh 2>/dev/null)" || die "tunnel failed — see /tmp/cf-tunnel-${HTTP_PORT}.log"
-[ -n "${BOT_MCP_URL:-}" ] || die "tunnel did not export BOT_MCP_URL"
-for _ in $(seq 1 20); do
-  curl -fsS -m 5 "${BOT_MCP_URL%/mcp}/state" >/dev/null 2>&1 && break; sleep 2
-done
-ok "tunnel ${BOT_MCP_URL}"
+# ── 7. public reachability for the cloud agent ──────────────────────
+if [ "$MODE" = event ]; then
+  say "verifying relay registration"
+  # The bot dials out to the event server; confirm the event server
+  # agrees it's connected. This is the participant's own private status
+  # endpoint (keyed by their secret), not an admin call.
+  REG=""
+  for _ in $(seq 1 20); do
+    REG=$(curl -fsS -m 5 "${RELAY_URL%/}/p/${RELAY_KEY}/status" 2>/dev/null)
+    echo "$REG" | grep -q '"connected":true' && break
+    sleep 1
+  done
+  echo "$REG" | grep -q '"connected":true' \
+    || die "bot did not register with the relay at ${RELAY_URL} — check ${BLOG:-/tmp/mc-bot${SUFFIX}.log} for [relay] errors (is the event URL right? is the venue blocking WebSockets?)"
+  export BOT_MCP_URL="${RELAY_URL%/}/p/${RELAY_KEY}/mcp"
+  ok "relay registered — agent MCP URL ready"
+else
+  # SOLO mode: tunnel the local event server so the cloud agent can
+  # reach the relay (and the wiki) through one public URL.
+  say "opening quick-tunnel for the local event server"
+  TUNNEL_URL="$(TUNNEL_PORT=${EVENT_PORT} ./bot/tunnel.sh 2>/dev/null)" \
+    || die "tunnel failed — see /tmp/cf-tunnel-${EVENT_PORT}.log"
+  TUNNEL_URL="${TUNNEL_URL%/}"
+  [ -n "${TUNNEL_URL}" ] || die "tunnel did not produce a URL — see /tmp/cf-tunnel-${EVENT_PORT}.log"
+  export BOT_MCP_URL="${TUNNEL_URL}/p/${RELAY_KEY}/mcp"
+  export WIKI_MCP_URL="${WIKI_MCP_URL:-${TUNNEL_URL}/wiki/mcp}"
+  ok "tunnel ${TUNNEL_URL}"
+fi
 
 # ── 8. write env for the agent ───────────────────────────────────────
 rm -f "${ENVFILE}"
@@ -274,6 +358,8 @@ cat > "${ENVFILE}" <<EOF
 export PARTICIPANT='${PARTICIPANT}'
 export BOT_MCP_URL='${BOT_MCP_URL}'
 export BOT_STATE_URL='${BOT_STATE_URL}'
+export RELAY_URL='${RELAY_URL}'
+export RELAY_KEY='${RELAY_KEY}'
 export LEADERBOARD_URL='${LEADERBOARD_URL:-}'
 export LEADERBOARD_KEY='${LEADERBOARD_KEY:-}'
 export WIKI_MCP_URL='${WIKI_MCP_URL:-}'
@@ -292,7 +378,11 @@ echo
 [ -n "${INSTANCE}" ] && echo "  INSTANCE=${INSTANCE} python3 my_agent.py    # 5-min run (this instance)" \
                      || echo "  python3 my_agent.py            # 5-min run — every run posts; best counts"
 echo "  python3 my_agent.py --eval     # ~30-60s decision-probe scorecard (no run)"
-[ "$LOCAL_LB" = 1 ] && echo "  open http://localhost:8888    (leaderboard)"
+if [ "$MODE" = event ]; then
+  echo "  leaderboard: ${RELAY_URL}"
+else
+  echo "  leaderboard: http://localhost:${EVENT_PORT}"
+fi
 echo
 echo "  ./setup.sh --restart           # fresh world + clean restart"
 echo "  ./setup.sh --stop              # tear down"

@@ -1,197 +1,165 @@
 #!/usr/bin/env bash
 # Copyright 2026 Anthropic PBC
-# SPDX-License-Identifier: Apache-2.0
-
-# Facilitator one-shot: start the shared leaderboard + wiki MCP,
-# tunnel both, and print the env block participants paste.
 #
-#   ./host.sh           start everything; prints LEADERBOARD_URL etc.
-#   ./host.sh --open    open the 30-min scoring window (run at GO)
-#   ./host.sh --close   close the window early (board freezes)
-#   ./host.sh --stop    tear down host services
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Self-hosted event server launcher — the FALLBACK hosting path.
+#
+# The recommended way to host an event is a real container platform with
+# a stable URL (see event/README.md — Fly.io / Cloud Run / any Docker
+# host). Use this script only when that isn't available: it runs the
+# event server on THIS machine and exposes it through a cloudflared
+# quick-tunnel, whose URL changes if the tunnel ever restarts.
+#
+#   ./host.sh             start event server + tunnel + watchdog
+#   ./host.sh --stop      tear everything down (URL is lost!)
+#   ./host.sh --status    show URLs, keys, and service health
+#
+# Once it's up, ALL event operations (open/close scoring window, reset
+# board, see connected bots) happen in the web admin panel:
+#   <EVENT_URL>/admin   (admin key printed below / in .host-state/admin-key)
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+EVENT_PORT="${EVENT_PORT:-8888}"
 KEY="${WORKSHOP_KEY:-devkey}"
-DURATION="${DURATION:-1800}"
+EVENT_NAME="${EVENT_NAME:-Agent Battle}"
 STATE_DIR="$(pwd)/.host-state"
 mkdir -p "${STATE_DIR}"
 URLFILE="${STATE_DIR}/host-urls.env"
 ADMINFILE="${STATE_DIR}/admin-key"
-export LB_SNAPSHOT="${STATE_DIR}/lb-snapshot.json"
-# Facilitator-only key for /admin/session. Persisted so --open/--close
-# work across invocations; never shared with participants.
-[ -f "${ADMINFILE}" ] || python3 -c 'import secrets;print(secrets.token_hex(16))' > "${ADMINFILE}"
-ADMIN_KEY="$(cat "${ADMINFILE}")"
+DATA_DIR="${STATE_DIR}/event-data"
 
 say()  { printf "\033[1;36m▸\033[0m %s\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 die()  { printf "  \033[31m✗\033[0m %s\n" "$*"; exit 1; }
 
+# Facilitator-only key for the admin panel / admin API. Persisted across
+# restarts; never shared with participants.
+[ -f "${ADMINFILE}" ] || python3 -c 'import secrets;print(secrets.token_hex(16))' > "${ADMINFILE}"
+ADMIN_KEY="$(cat "${ADMINFILE}")"
+
 case "${1:-}" in
-  --reset)
-    say "resetting leaderboard (clears scores; tunnels + seed untouched)"
-    rm -f "${LB_SNAPSHOT}"
-    ps -eo pid,comm,args | awk '$2=="node" && index($0,"dev-server.mjs")>0 {print $1}' \
-      | xargs -r kill 2>/dev/null
-    sleep 1
-    ( cd leaderboard && WORKSHOP_KEY="${KEY}" ADMIN_KEY="${ADMIN_KEY}" PORT=8888 \
-        nohup node dev-server.mjs > /tmp/host-lb.log 2>&1 & )
-    for _ in $(seq 1 10); do
-      curl -fsS -m 2 http://localhost:8888/api/leaderboard >/dev/null 2>&1 && break
-      sleep 1
-    done
-    ok "board cleared; tunnels + seed unchanged"
-    [ -f "${URLFILE}" ] && { echo; echo "SHARE block (unchanged):"; cat "${URLFILE}"; }
-    exit 0 ;;
   --stop)
-    say "stopping host services..."
-    pkill -f dev-server.mjs 2>/dev/null
-    pkill -f wiki_mcp.py 2>/dev/null
-    for p in 8888 8077; do
-      ps -eo pid,args | grep "cloudflared.*:${p}\b" | grep -v grep \
-        | awk '{print $1}' | xargs -r kill 2>/dev/null
-    done
-    rm -f "$URLFILE" /tmp/host-*.log
-    ok "stopped"
+    say "stopping self-hosted event server..."
+    ps -eo pid,comm,args | awk '$2=="node" && index($0,"event/server.mjs")>0 {print $1}' \
+      | xargs -r kill 2>/dev/null
+    ps -eo pid,args | awk -v p=":${EVENT_PORT}" 'index($0,"cloudflared")>0 && index($0,p)>0 {print $1}' \
+      | xargs -r kill 2>/dev/null
+    pkill -f "host-watchdog" 2>/dev/null
+    rm -f "$URLFILE" /tmp/host-event.log
+    ok "stopped (the tunnel URL is gone — a restart mints a NEW one)"
     exit 0 ;;
-  --open|--close)
-    [ -f "$URLFILE" ] || die "no $URLFILE — run ./host.sh first"
-    . "$URLFILE"
-    action="${1#--}"
-    say "${action} scoring window → ${LEADERBOARD_URL}/admin/session"
-    body='{"action":"close"}'
-    [ "$action" = "open" ] && body="{\"action\":\"open\",\"duration_seconds\":${DURATION}}"
-    # Hit localhost directly (dev-server is on this machine) so a
-    # flaky tunnel doesn't block the facilitator. Show errors.
-    resp=$(curl -sS -m 10 -X POST "http://localhost:8888/api/admin/session" \
-      -H "x-admin-key: ${ADMIN_KEY}" -H content-type:application/json \
-      -d "$body" 2>&1) || die "request failed: $resp"
-    echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
-    # Echo current window state via the public URL too (best-effort)
-    curl -sS -m 5 "${LEADERBOARD_URL}/admin/session" 2>/dev/null \
-      | python3 -m json.tool 2>/dev/null || true
+  --status)
+    [ -f "$URLFILE" ] && cat "$URLFILE" || echo "not running (no ${URLFILE})"
+    echo
+    echo "admin key: ${ADMIN_KEY}"
+    curl -fsS -m 5 "http://localhost:${EVENT_PORT}/api/admin/status" -H "x-admin-key: ${ADMIN_KEY}" 2>/dev/null \
+      | python3 -m json.tool 2>/dev/null || echo "event server not responding on :${EVENT_PORT}"
     exit 0 ;;
+  --watchdog)
+    # Internal: keep the event server + tunnel alive. Re-exec'd into the
+    # background by the main path below; safe to run interactively too.
+    while true; do
+      sleep 60
+      curl -fsS -m 5 "http://localhost:${EVENT_PORT}/healthz" >/dev/null 2>&1 || {
+        echo "[watchdog] $(date -u +%FT%TZ) event server down — restarting" >> "${STATE_DIR}/watchdog.log"
+        "$0" >> "${STATE_DIR}/watchdog.log" 2>&1
+      }
+      if [ -f "$URLFILE" ]; then
+        # shellcheck disable=SC1090
+        . "$URLFILE"
+        curl -fsS -m 10 "${EVENT_URL}/healthz" >/dev/null 2>&1 || {
+          echo "[watchdog] $(date -u +%FT%TZ) tunnel dead — restarting (URL may change!)" >> "${STATE_DIR}/watchdog.log"
+          "$0" >> "${STATE_DIR}/watchdog.log" 2>&1
+        }
+      fi
+    done ;;
 esac
 
-# ── cloudflared ─────────────────────────────────────────────────────
-CF=$(command -v cloudflared || echo "${STATE_DIR}/cloudflared")
-if [ ! -x "$CF" ]; then
-  say "downloading cloudflared..."
-  case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64)  asset=cloudflared-linux-amd64 ;;
-    Linux-aarch64) asset=cloudflared-linux-arm64 ;;
-    Darwin-arm64)  asset=cloudflared-darwin-arm64.tgz ;;
-    Darwin-x86_64) asset=cloudflared-darwin-amd64.tgz ;;
-    *) die "install cloudflared manually (brew install cloudflared)" ;;
-  esac
-  if [[ "$asset" == *.tgz ]]; then
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}" \
-      | tar -xz -O cloudflared > "${STATE_DIR}/cloudflared"
-  else
-    curl -fsSL -o "${STATE_DIR}/cloudflared" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}"
-  fi
-  chmod +x "${STATE_DIR}/cloudflared"
-  CF="${STATE_DIR}/cloudflared"
-fi
-
 # ── deps ────────────────────────────────────────────────────────────
-[ -d leaderboard/node_modules ] || ( cd leaderboard && npm install --no-audit --no-fund --loglevel=error )
-python3 -c "import mcp" 2>/dev/null || pip3 install -q -r requirements.txt
-
-# ── leaderboard ─────────────────────────────────────────────────────
-say "leaderboard"
-if ! curl -fsS -m 2 http://localhost:8888/api/leaderboard >/dev/null 2>&1; then
-  ( cd leaderboard && WORKSHOP_KEY="${KEY}" ADMIN_KEY="${ADMIN_KEY}" PORT=8888 \
-      nohup node dev-server.mjs > /tmp/host-lb.log 2>&1 & )
-  for _ in $(seq 1 10); do
-    curl -fsS -m 2 http://localhost:8888/api/leaderboard >/dev/null 2>&1 && break; sleep 1
-  done
-fi
-ok "dev-server :8888"
-# Reuse an existing tunnel if one's already running for this port —
-# spawning a duplicate gives a NEW URL and overwrites host-urls.env,
-# diverging the SHARE block from what participants already have.
-LB=""
-if pgrep -f "cloudflared.*localhost:8888" >/dev/null 2>&1; then
-  LB=$( { grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/host-lb-tun.log 2>/dev/null || true; } | tail -1)
-fi
-if [ -z "$LB" ] || ! curl -fsS -m 5 "${LB}/api/leaderboard" >/dev/null 2>&1; then
-  : > /tmp/host-lb-tun.log
-  nohup "$CF" tunnel --url http://localhost:8888 > /tmp/host-lb-tun.log 2>&1 &
-  for _ in $(seq 1 30); do
-    LB=$( { grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/host-lb-tun.log 2>/dev/null || true; } | tail -1)
-    [ -n "$LB" ] && curl -fsS -m 5 "${LB}/api/leaderboard" >/dev/null 2>&1 && break
-    sleep 2
-  done
-fi
-[ -n "$LB" ] || die "leaderboard tunnel failed — see /tmp/host-lb-tun.log"
-ok "tunnel ${LB}"
-
-# ── wiki MCP ────────────────────────────────────────────────────────
-say "wiki MCP"
-if ! curl -fsS -m 2 http://localhost:8077/ >/dev/null 2>&1; then
-  pkill -f wiki_mcp.py 2>/dev/null; sleep 1
-  nohup python3 wiki_mcp.py > /tmp/host-wiki.log 2>&1 &
-  sleep 2
-fi
-WIKI=""
-if pgrep -f "cloudflared.*localhost:8077" >/dev/null 2>&1; then
-  WIKI=$( { grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/host-wiki-tun.log 2>/dev/null || true; } | tail -1)
-fi
-if [ -z "$WIKI" ]; then
-  : > /tmp/host-wiki-tun.log
-  nohup "$CF" tunnel --url http://localhost:8077 > /tmp/host-wiki-tun.log 2>&1 &
-fi
-for _ in $(seq 1 30); do
-  WIKI=$( { grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/host-wiki-tun.log 2>/dev/null || true; } | tail -1)
-  if [ -n "$WIKI" ] && python3 -c "
-from mcp.client.streamable_http import streamablehttp_client
-from mcp import ClientSession
-import asyncio
-async def go():
-    async with streamablehttp_client('${WIKI}/mcp') as (r,w,_):
-        async with ClientSession(r,w) as s:
-            await s.initialize()
-asyncio.run(go())
-" 2>/dev/null; then break; fi
-  sleep 2
-done
-[ -n "$WIKI" ] || die "wiki tunnel failed — see /tmp/host-wiki-tun.log"
-ok "tunnel ${WIKI}"
+[ -d event/node_modules ] || ( cd event && npm install --no-audit --no-fund --loglevel=error )
 
 # ── seed ────────────────────────────────────────────────────────────
-# Preserve the existing seed across re-runs so the SHARE block stays
+# Preserve the existing seed across re-runs so the event config stays
 # consistent. New seed only if MC_SEED is unset AND no prior URLFILE.
 SEED="${MC_SEED:-}"
 [ -z "$SEED" ] && [ -f "$URLFILE" ] && SEED="$(grep MC_SEED "$URLFILE" | sed -n "s/.*='\([^']*\)'.*/\1/p")"
 [ -z "$SEED" ] && SEED="$(python3 -c 'import secrets; print(secrets.randbelow(10**18 - 10**17) + 10**17)')"
 
+# ── event server ────────────────────────────────────────────────────
+say "event server"
+if ! curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" 2>/dev/null | grep -q '"ok":true'; then
+  # Replace anything stale on the port (e.g. the retired dev-server.mjs).
+  lsof -ti:"${EVENT_PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null
+  sleep 1
+  # nohup + full fd redirection, no subshell — see setup.sh for why a
+  # subshell hangs output-capturing callers (and why not setsid: macOS).
+  WORKSHOP_KEY="${KEY}" ADMIN_KEY="${ADMIN_KEY}" PORT="${EVENT_PORT}" \
+    DATA_DIR="${DATA_DIR}" MC_SEED="${SEED}" EVENT_NAME="${EVENT_NAME}" \
+    nohup node event/server.mjs < /dev/null > /tmp/host-event.log 2>&1 &
+  for _ in $(seq 1 15); do
+    curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  curl -fsS -m 2 "http://localhost:${EVENT_PORT}/healthz" >/dev/null 2>&1 \
+    || die "event server failed — see /tmp/host-event.log"
+fi
+ok "event server :${EVENT_PORT} (leaderboard + wiki MCP + bot relay + admin)"
+
+# ── tunnel ──────────────────────────────────────────────────────────
+say "public tunnel"
+TUNNEL_URL="$(TUNNEL_PORT=${EVENT_PORT} ./bot/tunnel.sh 2>/dev/null)" \
+  || die "tunnel failed — see /tmp/cf-tunnel-${EVENT_PORT}.log"
+TUNNEL_URL="${TUNNEL_URL%/}"
+[ -n "$TUNNEL_URL" ] || die "tunnel produced no URL — see /tmp/cf-tunnel-${EVENT_PORT}.log"
+ok "tunnel ${TUNNEL_URL}"
+
+# ── watchdog ────────────────────────────────────────────────────────
+if ! pgrep -f "host.sh --watchdog" >/dev/null 2>&1; then
+  nohup bash -c "exec -a host-watchdog \"$(pwd)/host.sh\" --watchdog" \
+    < /dev/null > /dev/null 2>&1 &
+  disown
+  ok "watchdog started (checks every 60s, log: .host-state/watchdog.log)"
+fi
+
 # ── persist + print ─────────────────────────────────────────────────
 cat > "$URLFILE" <<EOF
-export LEADERBOARD_URL='${LB}/api'
-export LEADERBOARD_KEY='${KEY}'
-export WIKI_MCP_URL='${WIKI}/mcp'
-export MC_SEED='${SEED}'
+EVENT_URL='${TUNNEL_URL}'
+LEADERBOARD_KEY='${KEY}'
+MC_SEED='${SEED}'
 EOF
 
 echo
 echo "════════════════════════════════════════════════════════════════"
-echo " SHARE THIS WITH PARTICIPANTS ON OTHER MACHINES"
-echo "════════════════════════════════════════════════════════════════"
-cat "$URLFILE"
+echo " EVENT IS UP — self-hosted (quick-tunnel URL, can change on restart)"
 echo "════════════════════════════════════════════════════════════════"
 echo
-echo " If YOU are also a participant on THIS machine, use localhost"
-echo " (your DNS may not resolve the tunnel from the host itself):"
-echo "   export LEADERBOARD_URL='http://localhost:8888/api'"
-echo "   export WIKI_MCP_URL='http://localhost:8077/mcp'"
-echo "   export LEADERBOARD_KEY='${KEY}'"
-echo "   export MC_SEED='${SEED}'"
+echo " 1. Commit this as .env.event in the public repo so participants"
+echo "    get it automatically:"
 echo
-echo " Projector (open on shared screen): http://localhost:8888/?cast=1"
+cat "$URLFILE" | sed 's/^/      /'
 echo
-echo " At GO:    ./host.sh --open      (opens ${DURATION}s scoring window)"
-echo " To end:   ./host.sh --close     (freezes the board)"
-echo " Cleanup:  ./host.sh --stop"
+echo " 2. Presenter bookmarks (keep these private):"
+echo "      admin panel   ${TUNNEL_URL}/admin"
+echo "      admin key     ${ADMIN_KEY}"
+echo
+echo " 3. Projector:"
+echo "      cast view     ${TUNNEL_URL}/"
+echo
+echo " Open/close the scoring window, reset the board, and watch"
+echo " connected bots from the admin panel — no shell needed."
+echo
+echo " NOTE: prefer real hosting (event/README.md) — if this machine's"
+echo " tunnel dies, the URL changes and every participant must re-pull"
+echo " .env.event."

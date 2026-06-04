@@ -1,5 +1,5 @@
 ---
-description: Set up the Agent Battle stack (deps, server, bot, tunnel) and get the participant to "ready"
+description: Set up the Agent Battle stack (deps, server, bot, relay) and get the participant to "ready"
 ---
 
 You are setting up the Agent Battle workshop stack for a participant.
@@ -9,17 +9,18 @@ different.
 
 ## Steps
 
-**1. Check the three participant env vars** that must be exported:
+**1. Check the participant env vars** that must be exported:
 
 ```bash
 for v in PARTICIPANT MINECRAFT_EULA; do
   if [ -z "${!v:-}" ]; then echo "MISSING: $v"; else echo "OK: $v"; fi
 done
-[ -f .env.event ] && echo ".env.event present (provides LEADERBOARD_URL, MC_SEED, etc.)" || echo "NO .env.event"
+[ -f .env.event ] && grep EVENT_URL .env.event || echo "NO .env.event"
 ```
 
-If any of the three are MISSING, stop and tell them what to export:
+If any are MISSING, stop and tell them what to export:
 - `ANTHROPIC_API_KEY` — their own key from console.anthropic.com
+  (optional if their environment has SDK OAuth/workload-identity auth)
 - `PARTICIPANT` — any unique name they pick
 - `MINECRAFT_EULA` — must be `accept`. Show them
   https://www.minecraft.net/eula and ask whether they agree.
@@ -27,13 +28,14 @@ If any of the three are MISSING, stop and tell them what to export:
   not set this for them or assume agreement** — the user has to
   affirmatively accept the EULA themselves.
 
-`LEADERBOARD_URL`, `LEADERBOARD_KEY`, `WIKI_MCP_URL`, `MC_SEED`
-come from the `.env.event` file in this directory — `setup.sh`
-reads them automatically. Do NOT block on these being unset in
-the shell. (If `.env.event` is missing AND none of the four are
-exported, ask the host for the SHARE block; otherwise proceed.)
+`EVENT_URL`, `LEADERBOARD_KEY`, and `MC_SEED` come from the
+`.env.event` file in this directory — `setup.sh` reads it
+automatically. Do NOT block on these. (If `.env.event` has an empty
+`EVENT_URL`, setup runs in SOLO mode — local event server + one
+quick-tunnel — which is correct for at-home practice.)
 
-Do NOT proceed until PARTICIPANT and MINECRAFT_EULA are set (ANTHROPIC_API_KEY is optional).
+Do NOT proceed until PARTICIPANT and MINECRAFT_EULA are set
+(ANTHROPIC_API_KEY is optional).
 
 **2. Run setup** and capture the full output:
 
@@ -62,8 +64,10 @@ playbook in CLAUDE.md and remediate. Common cases:
 | `npm install (bot) failed` | Likely a corp registry. Run `(cd bot && rm -rf node_modules package-lock.json && npm install --registry=https://registry.npmjs.org)` then re-run `./setup.sh`. |
 | `server failed — see /tmp/mc-server.log` | Read that log. If `Address already in use`: stale java holding :25565 → see CLAUDE.md "Killing leftovers". If `Unsupported class file`: Java too old, install 17+. |
 | `bot failed — see /tmp/mc-bot.log` | Read that log. Usually `Cannot find module` (npm install incomplete) or `ECONNREFUSED` (server not up yet — wait 10s, re-run). |
-| `tunnel failed` or `tunnel did not export BOT_MCP_URL` | Read `/tmp/cf-tunnel-8088.log`. Often a transient cloudflared download/DNS issue. Re-run `./setup.sh`. If cloudflared binary is missing: see CLAUDE.md. |
-| `ANTHROPIC_API_KEY not set` | They skipped step 1. Have them export it. |
+| `bot did not register with the relay` | Read `/tmp/mc-bot.log`, look for `[relay]` lines. Check `curl $EVENT_URL/api/config` works from their machine. If the event server is fine but WebSockets can't connect, the venue network may block them — escalate to the facilitator. |
+| `event server failed` (SOLO mode) | Read `/tmp/event-local.log`. Usually a missing `(cd event && npm install)`. |
+| `tunnel failed` (SOLO mode only) | Transient cloudflared issue. Re-run `./setup.sh`. If `/tmp/cloudflared` is missing or zero-byte, delete it so `tunnel.sh` re-downloads. |
+| `ANTHROPIC_API_KEY not set` warning | Fine to proceed if their environment has SDK auth; otherwise have them export it. |
 
 After remediating, re-run `./setup.sh` (it's idempotent). Loop until
 `▸ ready` or you hit something not in the playbook — then explain what
@@ -74,3 +78,4 @@ you see and ask if they want you to dig in.
 - Don't edit `my_agent.py` for them. Setup only.
 - Don't suggest what to put in `AGENT["system"]`. That's the workshop.
 - Don't run `python3 my_agent.py` for them. Hand off after `▸ ready`.
+- Never echo their `ANTHROPIC_API_KEY` value into the chat.

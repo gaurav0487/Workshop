@@ -2,25 +2,30 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 
-# Expose the bot's HTTP/MCP seam over a public cloudflared quick-tunnel
-# so a cloud-side Managed Agent can reach it. Prints BOT_MCP_URL on
-# success. Idempotent — reuses an existing tunnel if /tmp/cf-tunnel.log
-# already has a live URL.
+# Expose a local port over a public cloudflared quick-tunnel and print the
+# resulting https URL on stdout. Used in SOLO mode only, to make the local
+# event server (leaderboard + wiki + bot relay) reachable by the cloud
+# agent. EVENT mode needs no tunnels at all — the bot dials out to the
+# shared event server instead.
+#
+# Idempotent — reuses an existing live tunnel for the same port rather
+# than minting a new URL (quick-tunnel creation is rate-limited per
+# source IP, and a new URL invalidates the agent's registered MCP URL).
 #
 # Usage:
-#   ./bot/tunnel.sh                  # prints BOT_MCP_URL=https://...
-#   eval "$(./bot/tunnel.sh)"        # exports BOT_MCP_URL into your shell
+#   ./bot/tunnel.sh                   # tunnels :8888 (the event server)
+#   TUNNEL_PORT=9000 ./bot/tunnel.sh  # tunnels another port
 #   ./bot/tunnel.sh --stop
 set -euo pipefail
 
-HTTP_PORT="${HTTP_PORT:-8088}"
-LOG="/tmp/cf-tunnel-${HTTP_PORT}.log"
+TUNNEL_PORT="${TUNNEL_PORT:-8888}"
+LOG="/tmp/cf-tunnel-${TUNNEL_PORT}.log"
 BIN="${CLOUDFLARED:-/tmp/cloudflared}"
 
 if [ "${1:-}" = "--stop" ]; then
-  pkill -x cloudflared 2>/dev/null || true
+  pkill -f "cloudflared tunnel --url http://localhost:${TUNNEL_PORT}" 2>/dev/null || true
   rm -f "${LOG}"
-  echo "[tunnel] stopped"
+  echo "[tunnel] stopped" >&2
   exit 0
 fi
 
@@ -44,12 +49,24 @@ if [ ! -x "${BIN}" ] && ! command -v cloudflared >/dev/null 2>&1; then
 fi
 [ -x "${BIN}" ] || BIN="$(command -v cloudflared)"
 
+# Reuse a live tunnel if its URL still answers. The health check goes to
+# /healthz (event server liveness); fall back to plain reachability for
+# any other port.
 url="$(grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' "${LOG}" 2>/dev/null | tail -1 || true)"
-if [ -z "${url}" ] || ! curl -fsS -m 5 "${url}/state" -o /dev/null 2>/dev/null; then
-  echo "[tunnel] starting cloudflared for :${HTTP_PORT}..." >&2
-  pkill -f "cloudflared tunnel --url http://localhost:${HTTP_PORT}" 2>/dev/null || true
+alive() {
+  curl -fsS -m 5 "$1/healthz" -o /dev/null 2>/dev/null \
+    || curl -fsS -m 5 "$1" -o /dev/null 2>/dev/null
+}
+if [ -z "${url}" ] || ! alive "${url}"; then
+  echo "[tunnel] starting cloudflared for :${TUNNEL_PORT}..." >&2
+  pkill -f "cloudflared tunnel --url http://localhost:${TUNNEL_PORT}" 2>/dev/null || true
   : > "${LOG}"
-  nohup "${BIN}" tunnel --url "http://localhost:${HTTP_PORT}" > "${LOG}" 2>&1 &
+  # nohup + ALL THREE fds redirected: cloudflared must never hold this
+  # script's stdout — callers capture it via $() and would hang waiting
+  # for pipe EOF. Deliberately nohup, NOT setsid: some hardened hosts'
+  # security tooling SIGKILLs a /tmp binary that detaches into its own
+  # session, while the same binary under nohup runs fine.
+  nohup "${BIN}" tunnel --url "http://localhost:${TUNNEL_PORT}" < /dev/null > "${LOG}" 2>&1 &
   url=""
   for _ in $(seq 1 20); do
     sleep 1
@@ -63,16 +80,5 @@ if [ -z "${url}" ]; then
   exit 1
 fi
 
-# CMA's mcp_servers schema has no auth field, so the workshop runs the bot
-# in dev mode (BOT_TOKEN unset → bot.js requireAuth is a no-op). The
-# cloudflared subdomain itself is the effective access token — don't
-# screen-share it. Pass through a caller-set BOT_TOKEN for non-CMA use.
-BOT_TOKEN="${BOT_TOKEN:-}"
-
-echo "export BOT_MCP_URL='${url}/mcp'"
-if [ -n "${BOT_TOKEN}" ]; then
-  echo "export BOT_TOKEN='${BOT_TOKEN}'"
-  echo "[tunnel] ${url}/mcp (token: ${BOT_TOKEN:0:6}…)" >&2
-else
-  echo "[tunnel] ${url}/mcp (no BOT_TOKEN — bot in dev mode)" >&2
-fi
+echo "[tunnel] ${url} → localhost:${TUNNEL_PORT}" >&2
+echo "${url}"

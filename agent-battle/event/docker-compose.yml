@@ -1,0 +1,28 @@
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+#
+# Run the event server on any Docker host (a VM, a homespace, a NUC at
+# the venue). Pair with a reverse proxy / tunnel that gives it a public
+# HTTPS URL, then set PUBLIC_URL accordingly.
+#
+#   WORKSHOP_KEY=devkey ADMIN_KEY=$(openssl rand -hex 16) docker compose up -d
+
+services:
+  event:
+    build: .
+    ports:
+      - "8888:8888"
+    environment:
+      WORKSHOP_KEY: ${WORKSHOP_KEY:-devkey}
+      ADMIN_KEY: ${ADMIN_KEY:?set ADMIN_KEY}
+      MC_SEED: ${MC_SEED:-611578087908456433}
+      EVENT_NAME: ${EVENT_NAME:-Agent Battle}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      REPO_URL: ${REPO_URL:-https://github.com/anthropics/cwc-workshops}
+      REPO_DIR: ${REPO_DIR:-agent-battle}
+    volumes:
+      - event-data:/data
+    restart: unless-stopped
+
+volumes:
+  event-data:

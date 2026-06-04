@@ -14,3 +14,6 @@ recordings/
 .agent_cache*.json
 .agent_running*.lock
 .env.setup
+.relay-key*
+event/data/
+event/test/.smoke-data/
